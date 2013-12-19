@@ -8,14 +8,16 @@ import scala.concurrent.duration._
 import org.specs2.time.NoTimeConversions
 import spray.json.{JsBoolean, JsArray, JsObject}
 import java.io.File
-import scala.concurrent.{Await, Future}
+import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.util.Success
-import scala.collection.immutable
+import scala.collection.immutable.Seq
 import com.typesafe.jse.Rhino
 import akka.actor.ActorSystem
 
 @RunWith(classOf[JUnitRunner])
 class JshinterSpec extends Specification with NoTimeConversions {
+
+  import ExecutionContext.Implicits.global
 
   def jshinterTester(implicit system: ActorSystem): Jshinter = {
     val shellSource = new File(this.getClass.getClassLoader.getResource("shell.js").toURI)
@@ -31,29 +33,34 @@ class JshinterSpec extends Specification with NoTimeConversions {
   "the jshinter" should {
     "receive source with no options and find an error" in new TestActorSystem {
       val fileToLint = new File(this.getClass.getResource("some.js").toURI)
-      val filesToLint = immutable.Seq(fileToLint)
+      val filesToLint = Seq(fileToLint)
       val options = JsObject()
 
-      val futureResult: Future[JsArray] = jshinterTester.lint(filesToLint, options)
+      val futureResult: Future[Seq[Jshinter.Result]] = jshinterTester.lint(filesToLint, options)
 
-      Await.result(futureResult, timeout.duration)
-      val Success(result: JsArray) = futureResult.value.get
+      val result = Await.result(futureResult, timeout.duration)
 
-      result.elements.size must_== 1
-      result.elements(0).toString() must_== s"""["${fileToLint.getCanonicalPath}",[{"id":"(error)","raw":"Missing semicolon.","code":"W033","evidence":"var a = 1","line":1,"character":10,"scope":"(main)","reason":"Missing semicolon."}]]"""
+      result.to[Vector] must_== Vector(
+        Jshinter.Result(fileToLint, Some(Vector(Jshinter.Problem(
+          message = "Missing semicolon.",
+          severity = Jshinter.Error,
+          lineContent = "var a = 1",
+          lineNumber = 1,
+          characterOffset = 10
+        ))))
+      )
     }
 
     "receive source and options and not find an error" in new TestActorSystem {
       val fileToLint = new File(this.getClass.getResource("some.js").toURI)
-      val filesToLint = immutable.Seq(fileToLint)
+      val filesToLint = Seq(fileToLint)
       val options = JsObject("asi" -> JsBoolean(true))
 
-      val futureResult: Future[JsArray] = jshinterTester.lint(filesToLint, options)
+      val futureResult: Future[Seq[Jshinter.Result]] = jshinterTester.lint(filesToLint, options)
 
-      Await.result(futureResult, timeout.duration)
-      val Success(result: JsArray) = futureResult.value.get
+      val result = Await.result(futureResult, timeout.duration)
 
-      result.elements.size must_== 0
+      result.to[Vector] must_== Vector(Jshinter.Result(fileToLint, None))
     }
   }
 }

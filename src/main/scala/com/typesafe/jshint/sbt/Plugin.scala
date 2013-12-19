@@ -5,11 +5,11 @@ import sbt.Keys._
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.{Await, Future}
 import scala.concurrent.duration._
-import spray.json._
+import spray.json.{ JsObject, pimpString }
 import com.typesafe.web.sbt.WebPlugin.WebKeys
+import com.typesafe.web.sbt.incremental._
 import com.typesafe.jse.sbt.JsEnginePlugin.JsEngineKeys
 import com.typesafe.jse.{Rhino, PhantomJs, Node, CommonNode}
-import scala.collection.immutable
 import com.typesafe.jshint.Jshinter
 import com.typesafe.web.sbt._
 import sbt.File
@@ -32,8 +32,8 @@ object JSHintPlugin extends sbt.Plugin {
     val config = SettingKey[Option[File]]("jshint-config", "The location of a JSHint configuration file.")
     val resolvedConfig = TaskKey[Option[File]]("jshint-resolved-config", "The actual location of a JSHint configuration file if present. If jshint-config is none then the task will seek a .jshintrc in the project folder. If that's not found then .jshintrc will be searched for in the user's home folder. This behaviour is consistent with other JSHint tooling.")
 
-    val modifiedJsFiles = TaskKey[Seq[File]]("jshint-modified-js-files", "Determine the Js files that are modified.")
-    val modifiedJsTestFiles = TaskKey[Seq[File]]("jshint-modified-js-test-files", "Determine the Js files that are modified for test.")
+    val jsFiles = TaskKey[Seq[File]]("jshint-modified-js-files", "Determine the Js files that are modified.")
+    val jsTestFiles = TaskKey[Seq[File]]("jshint-modified-js-test-files", "Determine the Js files that are modified for test.")
 
     val shellSource = SettingKey[File]("jshint-shelljs-source", "The target location of the js shell script to use.")
     val jshintSource = SettingKey[File]("jshint-jshintjs-source", "The target location of the jshint script to use.")
@@ -50,18 +50,8 @@ object JSHintPlugin extends sbt.Plugin {
     resolvedConfig <<= (config, baseDirectory) map resolveConfigTask,
     jshintOptions <<= resolvedConfig map jshintOptionsTask,
 
-    modifiedJsFiles <<= (
-      streams,
-      unmanagedSources in Assets,
-      jsFilter in Assets,
-      jshintOptions
-      ) map getModifiedJsFilesTask,
-    modifiedJsTestFiles <<= (
-      streams,
-      unmanagedSources in TestAssets,
-      jsFilter in TestAssets,
-      jshintOptions
-      ) map getModifiedJsFilesTask,
+    jsFiles := ((unmanagedSources in Assets).value ** (jsFilter in Assets).value).get,
+    jsTestFiles := ((unmanagedSources in TestAssets).value ** (jsFilter in TestAssets).value).get,
 
     shellSource := getFileInTarget(target.value, "shell.js"),
     // FIXME: This resource will eventually be located from its webjar. For now
@@ -73,7 +63,7 @@ object JSHintPlugin extends sbt.Plugin {
       state,
       shellSource,
       jshintSource,
-      modifiedJsFiles,
+      jsFiles,
       jshintOptions,
       engineType,
       parallelism,
@@ -84,7 +74,7 @@ object JSHintPlugin extends sbt.Plugin {
       state,
       shellSource,
       jshintSource,
-      modifiedJsTestFiles,
+      jsTestFiles,
       jshintOptions,
       engineType,
       parallelism,
@@ -132,37 +122,20 @@ object JSHintPlugin extends sbt.Plugin {
     }
   }
 
-  private def getModifiedJsFilesTask(s: TaskStreams, unmanagedSources: Seq[File], jsFilter: FileFilter, jshintOptions: JsObject): Seq[File] = {
-    val sourceFileManager = SourceFileManager(s.cacheDirectory / this.getClass.getName)
-    val jsSources = (unmanagedSources ** jsFilter).get
-    val buildSettingsDigest = jsFilter.toString + jshintOptions
-    val modifiedJsSources = sourceFileManager.setAndCompareBuildStamps(
-      jsSources.map(jsSource => (jsSource, jsSource.lastModified().toString + buildSettingsDigest))
-        .to[immutable.Seq]
-    )
-    if (modifiedJsSources.size > 0) {
-      sourceFileManager.save()
-    }
-    modifiedJsSources
-  }
-
   private def jshintTask(
                           state: State,
                           shellSource: File,
                           jshintSource: File,
-                          modifiedJsSources: Seq[File],
+                          jsSources: Seq[File],
                           jshintOptions: JsObject,
                           engineType: EngineType.Value,
                           parallelism: Int,
-                          s: TaskStreams,
+                          streams: TaskStreams,
                           reporter: LoggerReporter,
                           testing: Boolean
                           ): Unit = {
 
-    import DefaultJsonProtocol._
     import WebPlugin._
-
-    reporter.reset()
 
     val engineProps = engineType match {
       case EngineType.CommonNode => CommonNode.props()
@@ -171,73 +144,57 @@ object JSHintPlugin extends sbt.Plugin {
       case EngineType.Rhino => Rhino.props()
     }
 
+    implicit val opInputHasher = OpInputHasher[File](source => OpInputHash.hashString(source + "|" + jshintOptions.compactPrint))
+    val problems = runIncremental(streams, jsSources.to[Seq]) { neededSources: Seq[File] =>
+      val testKeyword = if (testing) "test " else ""
+      if (neededSources.size > 0) {
+        streams.log.info(s"JavaScript linting on ${neededSources.size} ${testKeyword}source(s)")
+      }
 
-    val testKeyword = if (testing) "test " else ""
-    if (modifiedJsSources.size > 0) {
-      s.log.info(s"JavaScript linting on ${modifiedJsSources.size} ${testKeyword}source(s)")
-    }
-
-    val resultBatches: immutable.Seq[Future[JsArray]] =
-      try {
-        val sourceBatches = (modifiedJsSources grouped Math.max(modifiedJsSources.size / parallelism, 1)).to[immutable.Seq]
-        sourceBatches.map {
-          sourceBatch =>
-            withActorRefFactory(state, this.getClass.getName) {
-              arf =>
-                val engine = arf.actorOf(engineProps)
-                val jshinter = Jshinter(engine, shellSource, jshintSource)
-                jshinter.lint(sourceBatch.to[immutable.Seq], jshintOptions)
+      def lintBatch(sourceBatch: Seq[File]): Future[(Map[File,OpResult], Seq[Problem])] = {
+        withActorRefFactory(state, this.getClass.getName) { implicit arf =>
+          val engine = arf.actorOf(engineProps)
+          val jshinter = Jshinter(engine, shellSource, jshintSource)
+          val futureResults = jshinter.lint(sourceBatch, jshintOptions)
+          futureResults.map { lintResults: Seq[Jshinter.Result] =>
+            lintResults.foldLeft[(Map[File,OpResult], Seq[Problem])]((Map.empty, Seq.empty)) {
+              case ((resultMap, problemSeq), Jshinter.Result(source, None)) =>
+                val newResult = OpSuccess(filesRead = Set(source), filesWritten = Set.empty)
+                (resultMap.updated(source, newResult), problemSeq)
+              case ((resultMap, problemSeq), Jshinter.Result(source, Some(lintProblems))) =>
+                val newResult = OpFailure
+                val newProblems: Seq[Problem] = lintProblems.map { lp =>
+                  new LineBasedProblem(
+                    lp.message,
+                    lp.severity match {
+                      case Jshinter.Info => Severity.Info
+                      case Jshinter.Warn => Severity.Warn
+                      case Jshinter.Error => Severity.Error
+                    },
+                    lp.lineNumber,
+                    lp.characterOffset,
+                    lp.lineContent,
+                    source
+                  )
+                }
+                (resultMap.updated(source, newResult), problemSeq ++ newProblems)
             }
+          }
         }
       }
 
-    val pendingResults = Future.sequence(resultBatches)
-    val allProblems: immutable.Seq[Problem] = (for {
-      allResults <- Await.result(pendingResults, 10.seconds)
-      result <- allResults.elements
-    } yield {
-      val resultTuple = result.convertTo[JsArray]
-      val source = file(resultTuple.elements(0).convertTo[String])
-      resultTuple.elements(1).convertTo[JsArray].elements.map {
-        case o: JsObject =>
-          def getReason(o: JsObject): String = o.fields.get("reason").get.toString()
-
-          def lineBasedProblem(o: JsObject, s: Severity): Problem =
-            new LineBasedProblem(
-              getReason(o),
-              s,
-              java.lang.Double.parseDouble(o.fields.get("line").get.toString()).toInt,
-              java.lang.Double.parseDouble(o.fields.get("character").get.toString()).toInt - 1,
-              o.fields.get("evidence") match {
-                case Some(JsString(line)) => line
-                case _ => ""
-              },
-              source
-            )
-
-          o.fields.get("id") match {
-            case Some(JsString("(error)")) => lineBasedProblem(o, Severity.Error)
-            case Some(JsString("(info)")) => lineBasedProblem(o, Severity.Info)
-            case Some(JsString("(warn)")) => lineBasedProblem(o, Severity.Warn)
-            case Some(id@_) => new GeneralProblem(s"Unknown type of error: $id with reason: ${getReason(o)}", source)
-            case _ => new GeneralProblem(s"Malformed error with reason: ${getReason(o)}", source)
-          }
-        case x@_ => new GeneralProblem(s"Malformed result: $x", source)
-      }.to[immutable.Seq]
-    }).flatten
-
-    allProblems.foreach(p => reporter.log(p.position(), p.message(), p.severity()))
-    reporter.printSummary()
-    allProblems.find(_.severity() == Severity.Error).foreach(throw new LintingFailedException(allProblems.toArray))
+      val sourceBatches = (neededSources grouped Math.max(neededSources.size / parallelism, 1)).to[Seq]
+      val batchResults: Seq[Future[(Map[File,OpResult], Seq[Problem])]] = sourceBatches.map(lintBatch)
+      val unbatchedResults: Future[Seq[(Map[File,OpResult], Seq[Problem])]] = Future.sequence(batchResults)
+      val combinedResults: Future[(Map[File,OpResult], Seq[Problem])] = unbatchedResults.map { seq: Seq[(Map[File,OpResult], Seq[Problem])] =>
+        seq.foldLeft[(Map[File,OpResult], Seq[Problem])]((Map.empty, Seq.empty)) {
+          case ((combinedResultMap, combinedProblemSeq), (batchResultMap, batchProblemSeq)) =>
+            (combinedResultMap ++ batchResultMap, combinedProblemSeq ++ batchProblemSeq)
+        }
+      }
+      Await.result(combinedResults, 10.seconds): (Map[File,OpResult], Seq[Problem])
+    }
+    CompileProblems.report(reporter, problems)
   }
 
 }
-
-
-class LintingFailedException(override val problems: Array[Problem])
-  extends CompileFailed
-  with FeedbackProvidedException {
-
-  override val arguments: Array[String] = Array.empty
-}
-

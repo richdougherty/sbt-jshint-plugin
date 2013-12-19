@@ -58,17 +58,13 @@
 
     var options = JSON.parse(args[OPTIONS_ARG]);
 
-    var errorReported = false;
     console.log("[");
-    JSON.parse(args[SOURCE_FILE_PATHS_ARG]).forEach(function (sourceFilePath) {
+    JSON.parse(args[SOURCE_FILE_PATHS_ARG]).forEach(function (sourceFilePath, sourceIndex) {
         var source = fs.read(sourceFilePath);
-        if (!jshint(source, options)) {
-            if (errorReported) {
-                console.log(",");
-            }
-            console.log(JSON.stringify([sourceFilePath, jshint.errors]));
-            errorReported = true;
-        }
+        var successful = jshint(source, options)
+        if (sourceIndex > 0) { console.log(","); }
+        var result = [sourceFilePath, successful ? null : jshint.errors];
+        console.log(JSON.stringify(result));
     });
     console.log("]");
 
